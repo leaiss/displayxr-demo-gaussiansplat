@@ -44,7 +44,11 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
 endif()
 set(SHADER_DIR "${GS_COMMON}/shaders")
 set(GS_SHADERS precomp_cov3d.comp preprocess.comp prefix_sum.comp
-    preprocess_sort.comp hist.comp sort.comp tile_boundary.comp render.comp)
+    preprocess_sort.comp hist.comp sort.comp tile_boundary.comp render.comp
+    # Adreno/TBDR-native graphics-pipeline splat rasterizer (replaces the
+    # compute-tile composite on Android): per-gaussian depth-sort keygen +
+    # instanced alpha-blended quad vert/frag.
+    splat_keys.comp splat.vert splat.frag)
 set(SHADER_HEADERS "")
 foreach(S ${GS_SHADERS})
     string(MAKE_C_IDENTIFIER ${S} VN)          # preprocess_sort.comp -> preprocess_sort_comp
