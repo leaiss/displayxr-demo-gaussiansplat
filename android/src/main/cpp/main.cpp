@@ -749,6 +749,19 @@ gs_init()
 		}
 	}
 	g_gs.setKeepFraction(gsKeep);
+
+	// (3) Render path `debug.dxr.gs.graphics` (default 1 = ON): the Adreno/TBDR-
+	//     native graphics pipeline (instanced alpha-blended quads, hardware GMEM
+	//     blending, per-gaussian depth sort) instead of the desktop compute-tile
+	//     composite. Set 0 to A/B against the compute path. Set before loadScene.
+	bool gsGraphics = true;
+	{
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.gs.graphics", buf) > 0 && buf[0] == '0')
+			gsGraphics = false;
+	}
+	g_gs.setGraphicsPath(gsGraphics);
+	LOGI("GsRenderer path: %s", gsGraphics ? "graphics (TBDR)" : "compute-tile");
 	g_gs_ready = true;
 	LOGI("GsRenderer initialized (%ux%u/eye, render_scale=%.2f)",
 	     g_views[0].width, g_views[0].height, gsScale);

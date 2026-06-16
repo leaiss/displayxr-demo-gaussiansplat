@@ -173,6 +173,14 @@ struct GsRenderer {
     void setKeepFraction(float f) { cullKeepFrac_ = (f > 0.05f && f <= 1.0f) ? f : 1.0f; }
     float keepFraction() const { return cullKeepFrac_; }
 
+    // Select the Adreno/TBDR-native graphics-pipeline splat path (instanced
+    // alpha-blended quads + hardware GMEM blending + per-gaussian depth sort)
+    // instead of the compute-tile composite. Set BEFORE loadScene(). On a
+    // tile-based mobile GPU this avoids the ~1.4M-fragment global sort + the
+    // storage-image composite that dominate the compute path.
+    void setGraphicsPath(bool on) { useGraphicsPath_ = on; }
+    bool graphicsPath() const { return useGraphicsPath_; }
+
     // Clean up all resources.
     void cleanup();
 
@@ -284,6 +292,23 @@ private:
     VkDescriptorSet dsRenderSet0_ = VK_NULL_HANDLE;
     VkDescriptorSet dsRenderSet1_ = VK_NULL_HANDLE;
 
+    // ── Adreno/TBDR-native graphics-pipeline splat path ──────────────────
+    // Alternative to the compute-tile composite: a per-gaussian depth-sort
+    // keygen (splat_keys.comp, reuses the existing radix sort over N) + an
+    // instanced alpha-blended quad draw (splat.vert/frag) into a render pass on
+    // renderImage_, composited in GMEM. Enabled via setGraphicsPath(true).
+    bool useGraphicsPath_ = false;
+    VkPipeline pipeSplatKeys_ = VK_NULL_HANDLE;          // compute keygen
+    VkPipelineLayout layoutSplatKeys_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslSplatKeys_ = VK_NULL_HANDLE;
+    VkDescriptorSet dsSplatKeys_ = VK_NULL_HANDLE;
+    VkRenderPass splatRenderPass_ = VK_NULL_HANDLE;
+    VkFramebuffer splatFramebuffer_ = VK_NULL_HANDLE;    // renderImage_, w_ x h_
+    VkPipeline pipeSplat_ = VK_NULL_HANDLE;              // graphics
+    VkPipelineLayout layoutSplat_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslSplat_ = VK_NULL_HANDLE;
+    VkDescriptorSet dsSplat_ = VK_NULL_HANDLE;
+
     // ── Radix sort sizing ────────────────────────────────────────────────
     uint32_t numRadixSortBlocksPerWG_ = 256;  // Apple default
     uint32_t numSortWorkgroups_ = 0;
@@ -302,6 +327,16 @@ private:
     bool createPipelines();
     bool createBuffers();
     bool createDescriptorSets();
+    // Graphics-pipeline splat path: keygen compute pipeline + render pass +
+    // graphics pipeline + framebuffer (built once, after renderImage_ exists).
+    bool createGraphicsPath();
+    // Per-eye render via the graphics path (preprocess → depth sort → instanced
+    // alpha-blended draw → blit). Mirrors renderEye's signature/args.
+    void renderEyeGraphics(VkImage swapchainImage, uint32_t viewportX, uint32_t viewportY,
+                           uint32_t viewportWidth, uint32_t viewportHeight,
+                           uint32_t rw, uint32_t rh, bool transparentBg,
+                           const float viewMatrix[16],
+                           float clipNearViewSpace, float clipFarViewSpace);
     // Reallocate sort buffers + sort histogram to hold at least requiredCapacity
     // tile fragments, and re-write the descriptor sets that bind them. Caller
     // must have wait-idled the queue. No-op if requiredCapacity fits.

@@ -38,6 +38,10 @@
 #include "sort.comp.h"
 #include "tile_boundary.comp.h"
 #include "render.comp.h"
+// Graphics-pipeline splat path (Adreno/TBDR-native).
+#include "splat_keys.comp.h"
+#include "splat.vert.h"
+#include "splat.frag.h"
 
 // ── Uniform buffer layout (std140, matches preprocess.comp) ──────────────
 struct alignas(16) GsUniformBuffer {
@@ -461,10 +465,13 @@ bool GsRenderer::createBuffers()
     tileBoundaryBuffer_ = gsCreateBuffer(device_, physDevice_,
         (VkDeviceSize)tileX_ * tileY_ * 2 * 4, ssboUsage, devLocal);
 
-    // Internal render image
+    // Internal render image. COLOR_ATTACHMENT too: the graphics-pipeline splat
+    // path renders into it via a render pass (composited in GMEM), then blits
+    // to the swapchain — the same image the compute path writes via STORAGE.
     renderImage_ = gsCreateImage2D(device_, physDevice_, width_, height_,
         VK_FORMAT_R8G8B8A8_UNORM,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 
     printf("GsRenderer: buffers allocated (N=%u, sortCap=%u, hist_wg=%u)\n",
            N, maxSortInstances_, numSortWorkgroups_);
@@ -479,12 +486,12 @@ bool GsRenderer::createDescriptorSets()
 {
     // Descriptor pool — count all needed descriptors
     VkDescriptorPoolSize poolSizes[] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 48},  // +5 for the graphics-path sets
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
     };
     VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pci.maxSets = 16;
+    pci.maxSets = 18;  // +2 for the graphics-path sets (keygen + splat)
     pci.poolSizeCount = 3;
     pci.pPoolSizes = poolSizes;
     if (vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_) != VK_SUCCESS) {
@@ -601,7 +608,183 @@ bool GsRenderer::createDescriptorSets()
     dsRenderSet1_ = allocDS(device_, descriptorPool_, dslRenderSet1_);
     writeImageDS(device_, dsRenderSet1_, 0, renderImage_.view);
 
+    // 11. Adreno/TBDR-native graphics path (render pass + pipelines + framebuffer
+    // + its descriptor sets). Built here so it picks up the per-scene renderImage_
+    // + sort buffers; torn down in cleanupScene alongside them.
+    if (useGraphicsPath_ && !createGraphicsPath()) {
+        fprintf(stderr, "GsRenderer: failed to create graphics splat path\n");
+        return false;
+    }
+
     printf("GsRenderer: descriptor sets created\n");
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// createGraphicsPath — Adreno/TBDR-native splat path (render pass + keygen
+// compute pipeline + instanced-quad graphics pipeline + framebuffer + sets).
+// Recreated per loadScene (references the per-scene renderImage_ + sort
+// buffers); destroyed in cleanupScene. Assumes a clean slate (cleanupScene ran).
+// ═════════════════════════════════════════════════════════════════════════
+
+bool GsRenderer::createGraphicsPath()
+{
+    // ── Keygen compute pipeline (splat_keys.comp): attr → {keys, payloads} ──
+    dslSplatKeys_ = createDSLayout(device_, {
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,   // 0 attr (in)
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,   // 1 keys (out, = sortKeysEven)
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}); // 2 payloads (out, = sortValsEven)
+    layoutSplatKeys_ = createPipeLayout(device_, {dslSplatKeys_},
+                                        sizeof(uint32_t) + 2 * sizeof(float)); // count, depthMin, invRange
+    {
+        VkShaderModule mod = createShaderModule(device_, splat_keys_comp_data,
+                                                sizeof(splat_keys_comp_data));
+        pipeSplatKeys_ = createComputePipeline(device_, layoutSplatKeys_, mod);
+        vkDestroyShaderModule(device_, mod, nullptr);
+    }
+
+    // ── Render pass: single colour attachment = renderImage_ ──
+    VkAttachmentDescription color = {};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;       // clear to transparent each eye
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;  // ready for the blit
+    VkAttachmentReference colorRef = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &colorRef;
+    // Sync the prior frame's blit-read and the next frame's blit-read against
+    // this pass's colour writes (renderImage_ is reused every eye).
+    VkSubpassDependency deps[2] = {};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpci.attachmentCount = 1; rpci.pAttachments = &color;
+    rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 2; rpci.pDependencies = deps;
+    if (vkCreateRenderPass(device_, &rpci, nullptr, &splatRenderPass_) != VK_SUCCESS) {
+        return false;
+    }
+
+    // ── Framebuffer over renderImage_ (full width_ x height_) ──
+    VkFramebufferCreateInfo fbci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fbci.renderPass = splatRenderPass_;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &renderImage_.view;
+    fbci.width = width_; fbci.height = height_; fbci.layers = 1;
+    if (vkCreateFramebuffer(device_, &fbci, nullptr, &splatFramebuffer_) != VK_SUCCESS) {
+        return false;
+    }
+
+    // ── Graphics pipeline DS layout: attr + sorted payloads (vertex stage) ──
+    {
+        VkDescriptorSetLayoutBinding b[2] = {};
+        for (uint32_t i = 0; i < 2; i++) {
+            b[i].binding = i;
+            b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ci.bindingCount = 2; ci.pBindings = b;
+        vkCreateDescriptorSetLayout(device_, &ci, nullptr, &dslSplat_);
+
+        VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 2 * sizeof(uint32_t)}; // width,height
+        VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        lci.setLayoutCount = 1; lci.pSetLayouts = &dslSplat_;
+        lci.pushConstantRangeCount = 1; lci.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(device_, &lci, nullptr, &layoutSplat_);
+    }
+
+    // ── Graphics pipeline (no vertex buffer; gl_VertexIndex/InstanceIndex) ──
+    {
+        VkShaderModule vs = createShaderModule(device_, splat_vert_data, sizeof(splat_vert_data));
+        VkShaderModule fs = createShaderModule(device_, splat_frag_data, sizeof(splat_frag_data));
+        VkPipelineShaderStageCreateInfo stages[2] = {};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   stages[0].module = vs; stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = fs; stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;  // 4-vert quad per instance
+
+        VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = 1; vp.scissorCount = 1;  // dynamic (set per eye to rw x rh)
+
+        VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        // depth/stencil OFF — splats are alpha-blended in sorted order.
+
+        // Back-to-front "over" with premultiplied colour (frag emits color*alpha).
+        VkPipelineColorBlendAttachmentState cba = {};
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1; cb.pAttachments = &cba;
+
+        VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynci = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynci.dynamicStateCount = 2; dynci.pDynamicStates = dyn;
+
+        VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gci.stageCount = 2; gci.pStages = stages;
+        gci.pVertexInputState = &vi; gci.pInputAssemblyState = &ia;
+        gci.pViewportState = &vp; gci.pRasterizationState = &rs;
+        gci.pMultisampleState = &ms; gci.pDepthStencilState = &dss;
+        gci.pColorBlendState = &cb; gci.pDynamicState = &dynci;
+        gci.layout = layoutSplat_; gci.renderPass = splatRenderPass_; gci.subpass = 0;
+        VkResult pr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gci, nullptr, &pipeSplat_);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyShaderModule(device_, fs, nullptr);
+        if (pr != VK_SUCCESS) return false;
+    }
+
+    // ── Descriptor sets (from the per-scene pool) ──
+    dsSplatKeys_ = allocDS(device_, descriptorPool_, dslSplatKeys_);
+    writeBufferDS(device_, dsSplatKeys_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  vertexAttrBuffer_.buffer, vertexAttrBuffer_.size);
+    writeBufferDS(device_, dsSplatKeys_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysEvenBuffer_.buffer, sortKeysEvenBuffer_.size);
+    writeBufferDS(device_, dsSplatKeys_, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsEvenBuffer_.buffer, sortValsEvenBuffer_.size);
+
+    dsSplat_ = allocDS(device_, descriptorPool_, dslSplat_);
+    writeBufferDS(device_, dsSplat_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  vertexAttrBuffer_.buffer, vertexAttrBuffer_.size);
+    writeBufferDS(device_, dsSplat_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsEvenBuffer_.buffer, sortValsEvenBuffer_.size);
+
+    printf("GsRenderer: graphics splat path created\n");
     return true;
 }
 
@@ -1054,6 +1237,223 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// renderEyeGraphics — Adreno/TBDR-native per-eye path
+//
+// preprocess (reused) → per-GAUSSIAN depth-sort keygen → radix sort over N
+// (not 1.4M fragments) → render pass with an instanced alpha-blended quad draw
+// (composited in GMEM) → blit to the swapchain. One command buffer, one submit,
+// one queue wait. No prefix-sum, no fragment expansion, no tile-boundary, no
+// storage-image composite, no GPU→CPU readback. Caller already ran
+// updateUniforms(rw, rh) so preprocess projects into the scaled grid.
+// ═════════════════════════════════════════════════════════════════════════
+
+void GsRenderer::renderEyeGraphics(VkImage swapchainImage,
+                                   uint32_t viewportX, uint32_t viewportY,
+                                   uint32_t viewportWidth, uint32_t viewportHeight,
+                                   uint32_t rw, uint32_t rh, bool transparentBg,
+                                   const float viewMatrix[16],
+                                   float clipNearViewSpace, float clipFarViewSpace)
+{
+    uint32_t N = numGaussians_;
+    uint32_t groups256 = (N + 255) / 256;
+
+    // Per-eye view-space depth quantization range (same derivation as the
+    // compute path's preprocess_sort: project the cached scene bbox corners to
+    // view depth, pad 2%, clamp to the cull window).
+    float depthQMin = 0.2f;
+    float depthQMax = depthQMin + 100.0f;
+    if (sceneBBoxValid_) {
+        float mnD = FLT_MAX, mxD = -FLT_MAX;
+        for (int ci = 0; ci < 8; ci++) {
+            const float cx = (ci & 1) ? sceneBBoxMax_[0] : sceneBBoxMin_[0];
+            const float cy = (ci & 2) ? sceneBBoxMax_[1] : sceneBBoxMin_[1];
+            const float cz = (ci & 4) ? sceneBBoxMax_[2] : sceneBBoxMin_[2];
+            const float d = -(viewMatrix[2] * cx + viewMatrix[6] * cy +
+                              viewMatrix[10] * cz + viewMatrix[14]);
+            mnD = std::min(mnD, d);
+            mxD = std::max(mxD, d);
+        }
+        const float pad = 0.02f * (mxD - mnD);
+        mnD -= pad; mxD += pad;
+        if (clipNearViewSpace > 0.0f) mnD = std::max(mnD, clipNearViewSpace);
+        if (clipFarViewSpace > 0.0f) mxD = std::min(mxD, clipFarViewSpace);
+        mnD = std::max(mnD, 0.2f);
+        if (mxD > mnD + 1e-6f) { depthQMin = mnD; depthQMax = mxD; }
+    }
+
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device_, &ai, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    const bool tsOn = (tsPool_ != VK_NULL_HANDLE);
+    if (tsOn) {
+        vkCmdResetQueryPool(cmd, tsPool_, 0, kNumTimestamps);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool_, 0);
+    }
+
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+
+    // ── Preprocess: project + SH + conic + depth per gaussian (writes attr[]) ──
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocess_);
+    VkDescriptorSet ppSets[] = {dsPreprocessSet0_, dsPreprocessSet1_};
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        layoutPreprocess_, 0, 2, ppSets, 0, nullptr);
+    vkCmdDispatch(cmd, groups256, 1, 1);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 1);
+
+    // ── Keygen: per-gaussian far-first depth key + index payload ──
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeSplatKeys_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        layoutSplatKeys_, 0, 1, &dsSplatKeys_, 0, nullptr);
+    struct KeyPC { uint32_t count; float depthMin; float invDepthRange; }
+        kpc = {N, depthQMin, 65535.0f / (depthQMax - depthQMin)};
+    vkCmdPushConstants(cmd, layoutSplatKeys_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(kpc), &kpc);
+    vkCmdDispatch(cmd, groups256, 1, 1);
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 3);
+
+    // ── Radix sort N gaussian keys (reuses the compute path's hist/sort over
+    //    the even/odd sort buffers; result ends in the EVEN buffers). Workgroup
+    //    count is the over-provisioned numSortWorkgroups_ — extra workgroups see
+    //    no elements (num_elements = N), which is correct, just a little slack.
+    struct RadixSortPC { uint32_t num_elements, shift, num_workgroups, num_blocks_per_workgroup; };
+    for (uint32_t pass = 0; pass < 4; pass++) {
+        bool even = (pass % 2 == 0);
+        RadixSortPC pc = {N, pass * 8, numSortWorkgroups_, numRadixSortBlocksPerWG_};
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeHist_);
+        VkDescriptorSet histDS = even ? dsHistEven_ : dsHistOdd_;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            layoutHist_, 0, 1, &histDS, 0, nullptr);
+        vkCmdPushConstants(cmd, layoutHist_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, numSortWorkgroups_, 1, 1);
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeSort_);
+        VkDescriptorSet sortDS = even ? dsSortEvenToOdd_ : dsSortOddToEven_;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            layoutSort_, 0, 1, &sortDS, 0, nullptr);
+        vkCmdPushConstants(cmd, layoutSort_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, numSortWorkgroups_, 1, 1);
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 4);
+
+    // Make the compute writes (attr[] + sorted payloads) visible to the vertex
+    // shader's SSBO reads before the draw.
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+    // ── Render pass: instanced alpha-blended quad draw into renderImage_ ──
+    VkClearValue clear = {};
+    clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    VkRenderPassBeginInfo rpbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rpbi.renderPass = splatRenderPass_;
+    rpbi.framebuffer = splatFramebuffer_;
+    rpbi.renderArea.offset = {0, 0};
+    rpbi.renderArea.extent = {rw, rh};
+    rpbi.clearValueCount = 1;
+    rpbi.pClearValues = &clear;
+    vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport vpt = {0.0f, 0.0f, (float)rw, (float)rh, 0.0f, 1.0f};
+    VkRect2D scis = {{0, 0}, {rw, rh}};
+    vkCmdSetViewport(cmd, 0, 1, &vpt);
+    vkCmdSetScissor(cmd, 0, 1, &scis);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeSplat_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        layoutSplat_, 0, 1, &dsSplat_, 0, nullptr);
+    uint32_t splatPC[2] = {rw, rh};
+    vkCmdPushConstants(cmd, layoutSplat_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(splatPC), splatPC);
+    vkCmdDraw(cmd, 4, N, 0, 0);  // 4-vert quad per gaussian instance, back-to-front
+    vkCmdEndRenderPass(cmd);     // renderImage_ now in TRANSFER_SRC_OPTIMAL
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 6);
+
+    // ── Blit the scaled render region up to the swapchain viewport ──
+    VkImageMemoryBarrier sb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    sb.srcAccessMask = (viewportX == 0) ? (VkAccessFlags)0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    sb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sb.oldLayout = (viewportX == 0) ? VK_IMAGE_LAYOUT_UNDEFINED
+                                    : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    sb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    sb.image = swapchainImage;
+    sb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
+
+    VkImageBlit blit = {};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[0] = {0, 0, 0};
+    blit.srcOffsets[1] = {(int32_t)rw, (int32_t)rh, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
+    blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
+                          (int32_t)(viewportY + viewportHeight), 1};
+    VkFilter filter = (rw == viewportWidth && rh == viewportHeight)
+                          ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    vkCmdBlitImage(cmd, renderImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+
+    sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    sb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 7);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+
+    // Per-stage GPU timing (reuses the GS_TS slots; preSort/tileBnd unused here).
+    frameCounter_++;
+    constexpr uint64_t kTsLogPeriod = 120;
+    if (tsOn && (frameCounter_ % kTsLogPeriod == 0)) {
+        uint64_t ts[kNumTimestamps] = {};
+        if (vkGetQueryPoolResults(device_, tsPool_, 0, kNumTimestamps, sizeof(ts), ts,
+                sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+            const uint64_t mask = (tsValidBits_ >= 64) ? ~0ULL : ((1ULL << tsValidBits_) - 1ULL);
+            auto ms = [&](uint32_t a, uint32_t b) -> double {
+                return (double)((ts[b] & mask) - (ts[a] & mask)) * (double)timestampPeriod_ / 1.0e6; };
+            GS_LOGI("GS_TS[gfx] N=%u render=%ux%u(scale=%.2f) | preproc=%.2f keygen=%.2f "
+                    "radix=%.2f draw=%.2f blit=%.2f | TOTAL=%.2f ms",
+                    N, rw, rh, renderScale_, ms(0, 1), ms(1, 3), ms(3, 4), ms(4, 6),
+                    ms(6, 7), ms(0, 7));
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // renderEye — full per-frame compute dispatch sequence
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -1094,6 +1494,16 @@ void GsRenderer::renderEye(VkImage swapchainImage,
     // Update uniform buffer with this eye's matrices (at the scaled dims)
     updateUniforms(viewMatrix, projMatrix, rw, rh,
                    clipNearViewSpace, clipFarViewSpace, clipFadeFrac);
+
+    // Adreno/TBDR-native graphics path: preprocess → per-gaussian depth sort →
+    // instanced alpha-blended draw (GMEM blend) → blit. No fragment expansion /
+    // global fragment sort / storage-image composite / CPU readback.
+    if (useGraphicsPath_) {
+        renderEyeGraphics(swapchainImage, viewportX, viewportY,
+                          viewportWidth, viewportHeight, rw, rh, transparentBg,
+                          viewMatrix, clipNearViewSpace, clipFarViewSpace);
+        return;
+    }
 
     uint32_t N = numGaussians_;
     uint32_t groups256 = (N + 255) / 256;
@@ -2076,6 +2486,19 @@ void GsRenderer::cleanupScene()
     dsTileBoundary_ = VK_NULL_HANDLE;
     dsRenderSet0_ = VK_NULL_HANDLE;
     dsRenderSet1_ = VK_NULL_HANDLE;
+
+    // Graphics-path objects (recreated per scene in createGraphicsPath). The
+    // descriptor sets were freed with the pool above — just clear the handles.
+    dsSplatKeys_ = VK_NULL_HANDLE;
+    dsSplat_ = VK_NULL_HANDLE;
+    if (splatFramebuffer_) { vkDestroyFramebuffer(device_, splatFramebuffer_, nullptr); splatFramebuffer_ = VK_NULL_HANDLE; }
+    if (pipeSplat_) { vkDestroyPipeline(device_, pipeSplat_, nullptr); pipeSplat_ = VK_NULL_HANDLE; }
+    if (layoutSplat_) { vkDestroyPipelineLayout(device_, layoutSplat_, nullptr); layoutSplat_ = VK_NULL_HANDLE; }
+    if (dslSplat_) { vkDestroyDescriptorSetLayout(device_, dslSplat_, nullptr); dslSplat_ = VK_NULL_HANDLE; }
+    if (pipeSplatKeys_) { vkDestroyPipeline(device_, pipeSplatKeys_, nullptr); pipeSplatKeys_ = VK_NULL_HANDLE; }
+    if (layoutSplatKeys_) { vkDestroyPipelineLayout(device_, layoutSplatKeys_, nullptr); layoutSplatKeys_ = VK_NULL_HANDLE; }
+    if (dslSplatKeys_) { vkDestroyDescriptorSetLayout(device_, dslSplatKeys_, nullptr); dslSplatKeys_ = VK_NULL_HANDLE; }
+    if (splatRenderPass_) { vkDestroyRenderPass(device_, splatRenderPass_, nullptr); splatRenderPass_ = VK_NULL_HANDLE; }
 
     // Destroy buffers
     gsDestroyBuffer(device_, vertexBuffer_);
